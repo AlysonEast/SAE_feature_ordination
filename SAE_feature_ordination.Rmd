@@ -1,0 +1,326 @@
+---
+title: "SAE feature ordination: PCA and CCA"
+author: "Alyson East"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r packages}
+library(vegan)
+library(ggplot2)
+```
+
+## 1. Read data
+
+The activation table has one row per patch, with columns for plot ID, image ID, and one column per SAE feature. The climate table has one row per plot.
+
+```{r}
+plot_mean <- read.csv("./CommunityMatrix_abund_2018.csv")
+clim  <- read.csv("./BeetlePlotswEnvData.csv")
+
+# feat_cols <- grep("^sae_", names(patch), value = TRUE)   # edit to match feature column names
+# env_vars  <- c("bio_1","bio_2","bio_3","bio_4",
+#                "bio_5","bio_6","bio_7","bio_8",
+#                "bio_9","bio_10","bio_11","bio_12",
+#                "bio_13","bio_14","bio_15","bio_16",
+#                "bio_17","bio_18","bio_19")# edit to match climate column names
+env_vars  <- c("bio_2","bio_4",
+               "bio_8",
+               "bio_9","bio_11",
+               "bio_15",
+               "bio_17","bio_18","bio_19")# edit to match climate column names
+
+clim<-clim[, c("plotID",env_vars)]
+
+summary(clim)
+```
+
+Join the community matrix to climate and run basic checks.
+
+```{r join}
+comm_full <- merge(plot_mean, clim, by = "plotID")
+nrow(comm_full)                                           # plots with both activations and climate
+setdiff(plot_mean$plotID, clim$plotID)             # plots missing climate
+setdiff(clim$plotID, plot_mean$plotID)             # plots missing imagery
+
+Y <- as.matrix(comm_full[, !names(comm_full) %in% c(env_vars, "plotID"), drop = FALSE])
+rownames(Y) <- comm_full$plotID
+env <- comm_full[, env_vars]
+
+anyNA(Y)
+anyNA(env)
+any(Y < 0)                                           # CA/CCA and Hellinger need non-negative data
+sum(apply(Y, 2, var) == 0)                           # features constant across plots
+```
+
+## 3. Zero inflation and distribution of the community matrix
+
+After the max-then-mean aggregation, a plot value is zero only when a feature never fires in any patch of any image in that plot. Zeros should therefore be rarer here than in the patch-level data.
+
+```{r zeros}
+mean(Y == 0)                                         # proportion of zero cells overall
+feat_zero <- colMeans(Y == 0)                        # per feature: fraction of plots with zero
+plot_zero <- rowMeans(Y == 0)                        # per plot: fraction of features with zero
+summary(feat_zero)
+summary(plot_zero)
+sum(feat_zero == 1)                                  # never active in any plot
+sum(feat_zero > 0.9)                                 # active in < 10% of plots
+
+ggplot(data.frame(feat_zero), aes(feat_zero)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white") +
+  labs(x = "Fraction of plots where feature is zero", y = "Features") +
+  theme_bw()
+
+ggplot(data.frame(value = Y[Y > 0]), aes(value)) +
+  geom_histogram(bins = 50, fill = "steelblue", colour = "white") +
+  scale_x_log10() +
+  labs(x = "Non-zero plot activations (log10 scale)", y = "Cells") +
+  theme_bw()
+
+## Mean-variance relationship: variance rising steeply with the mean
+## suggests a log or square-root type transformation.
+mv <- data.frame(mean = colMeans(Y), var = apply(Y, 2, var))
+ggplot(mv[mv$mean > 0, ], aes(mean, var)) +
+  geom_point(alpha = 0.5) +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = "Feature mean (log10)", y = "Feature variance (log10)") +
+  theme_bw()
+```
+
+### Transformation decision (made by hand)
+
+Look at the plots above, then pick one option and comment out the rest. As a rough guide:
+
+- **Many zeros and right-skewed values:** use Hellinger. It avoids treating shared zeros as similarity and is the standard choice for PCA on community data.
+- **Few zeros but strongly right-skewed:** use `log1p()` or `sqrt()`.
+- **Few zeros and roughly symmetric:** leave untransformed, and set `scale = TRUE` in the PCA.
+
+CCA is fit to the untransformed non-negative matrix `Y` below, because its chi-square distance already weights by row and column totals.
+
+```{r transform}
+## Optional: drop never- or rarely-active features first
+# Y <- Y[, feat_zero < 1]
+# Y <- Y[, feat_zero < 0.9]
+
+Y_t <- decostand(Y, method = "hellinger")
+# Y_t <- log1p(Y)
+# Y_t <- sqrt(Y)
+# Y_t <- Y
+
+ggplot(data.frame(value = as.vector(Y_t)), aes(value)) +
+  geom_histogram(bins = 50, fill = "darkorange", colour = "white") +
+  labs(x = "Transformed values", y = "Cells") +
+  theme_bw()
+```
+
+## 4. Pairs plots
+
+These show how the climate variables relate to each other. Strongly correlated pairs are a problem for CCA.
+
+```{r pairs-env, fig.width = 7, fig.height = 7}
+library(psych)
+pairs.panels(env)
+round(cor(env), 2)
+```
+
+Next, the five most variable features against climate. PCA assumes roughly linear relationships, while curved or humped smooths point toward unimodal responses (CCA).
+
+```{r pairs-feat, fig.width = 9, fig.height = 9}
+top_var <- names(sort(apply(Y_t, 2, var), decreasing = TRUE))[1:5]
+pairs(cbind(Y_t[, top_var], env), lower.panel = panel.smooth)
+```
+
+## 5. Assumption checks
+
+**Gradient length.** A DCA axis 1 length below about 3 SD suggests linear responses (PCA/RDA). Above about 4 SD suggests unimodal responses (CA/CCA).
+
+```{r dca}
+dca <- decorana(Y)
+dca
+```
+
+**Collinearity among constraints.** VIF values above about 10 indicate redundant predictors. Drop one from `env_vars` by hand and refit.
+
+```{r vif}
+vif.cca(cca(Y ~ ., data = env))
+```
+
+## 6. PCA (unconstrained)
+
+```{r pca}
+pca <- rda(Y_t)                      # use rda(Y_t, scale = TRUE) if not Hellinger-transformed
+round(summary(pca)$cont$importance[, 1:5], 3)
+screeplot(pca, bstick = TRUE, type = "lines", main = "PCA scree with broken stick")
+```
+
+Fit climate passively onto the PCA space to see whether the main axes of feature variation line up with climate.
+
+```{r pca-envfit}
+ef <- envfit(pca, env, permutations = 999)
+ef
+```
+
+```{r pca-biplot, fig.width = 8, fig.height = 6}
+site_sc <- as.data.frame(scores(pca, display = "sites", choices = 1:2, scaling = 2))
+site_sc <- cbind(site_sc, env)
+
+feat_sc <- as.data.frame(scores(pca, display = "species", choices = 1:2, scaling = 2))
+feat_sc$feature <- rownames(feat_sc)
+feat_sc$length  <- sqrt(feat_sc$PC1^2 + feat_sc$PC2^2)
+top_feat <- feat_sc[order(-feat_sc$length), ][1:10, ]
+
+env_sc <- as.data.frame(scores(ef, "vectors"))
+env_sc$var <- rownames(env_sc)
+
+## Stretch arrows to the extent of the site scores so they are visible
+f_mult <- max(abs(site_sc[, c("PC1", "PC2")])) / max(abs(top_feat[, c("PC1", "PC2")]))
+e_mult <- max(abs(site_sc[, c("PC1", "PC2")])) / max(abs(env_sc[, c("PC1", "PC2")]))
+
+ggplot(site_sc, aes(PC1, PC2)) +
+  geom_hline(yintercept = 0, colour = "grey85") +
+  geom_vline(xintercept = 0, colour = "grey85") +
+  geom_point(alpha = 0.7) +
+  scale_colour_viridis_c() +
+  geom_segment(data = top_feat, aes(x = 0, y = 0, xend = PC1 * f_mult, yend = PC2 * f_mult),
+               colour = "grey40", arrow = arrow(length = unit(1.5, "mm"))) +
+  geom_text(data = top_feat, aes(x = PC1 * f_mult, y = PC2 * f_mult, label = feature),
+            size = 2.5, colour = "grey30", vjust = -0.5) +
+  geom_segment(data = env_sc, aes(x = 0, y = 0, xend = PC1 * e_mult, yend = PC2 * e_mult),
+               colour = "firebrick", linewidth = 0.8, arrow = arrow(length = unit(2, "mm"))) +
+  geom_text(data = env_sc, aes(x = PC1 * e_mult, y = PC2 * e_mult, label = var),
+            colour = "firebrick", vjust = -0.5) +
+  labs(title = "PCA biplot: top 15 feature loadings (grey), climate fitted passively (red)") +
+  theme_bw()
+```
+
+### Interpreting the PCA axes
+
+These are the features loading most strongly at each end of PC1. Repeat for PC2 by swapping the column.
+
+```{r pca-loadings, fig.width = 7, fig.height = 6}
+pc1 <- feat_sc[order(feat_sc$PC1), ]
+pc1_ends <- rbind(head(pc1, 10), tail(pc1, 10))
+
+ggplot(pc1_ends, aes(reorder(feature, PC1), PC1)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(x = NULL, y = "PC1 loading", title = "Features at the ends of PC1") +
+  theme_bw()
+```
+
+The plots below show how plot positions on PC1 relate to each climate variable.
+
+```{r pca-env-scatter, fig.width = 8, fig.height = 6}
+pc_env <- data.frame(PC1      = rep(site_sc$PC1, length(env_vars)),
+                     variable = rep(env_vars, each = nrow(site_sc)),
+                     value    = unlist(env))
+
+ggplot(pc_env, aes(value, PC1)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess", colour = "firebrick") +
+  facet_wrap(~ variable, scales = "free_x") +
+  labs(x = "Climate value", y = "PC1 site score") +
+  theme_bw()
+```
+
+## 7. CCA (constrained)
+
+```{r cca}
+cca1 <- cca(Y ~ ., data = env)
+cca1
+round(eigenvals(cca1)[1:6] / cca1$tot.chi, 3)       # proportion of inertia per axis
+RsquareAdj(cca1)
+vif.cca(cca1)
+```
+
+These are permutation tests for the whole model, for each constrained axis, and for each variable given the others. The axis test can be slow.
+
+```{r cca-tests}
+anova(cca1, permutations = 999)
+anova(cca1, by = "axis", permutations = 999)
+anova(cca1, by = "margin", permutations = 999)
+```
+
+```{r cca-triplot, fig.width = 8, fig.height = 6}
+c_site <- as.data.frame(scores(cca1, display = "sites", choices = 1:2, scaling = 2))
+c_site <- cbind(c_site, env)
+
+c_feat <- as.data.frame(scores(cca1, display = "species", choices = 1:2, scaling = 2))
+c_feat$feature <- rownames(c_feat)
+c_feat$length  <- sqrt(c_feat$CCA1^2 + c_feat$CCA2^2)
+c_top <- c_feat[order(-c_feat$length), ][1:15, ]
+
+c_bp <- as.data.frame(scores(cca1, display = "bp", choices = 1:2, scaling = 2))
+c_bp$var <- rownames(c_bp)
+bp_mult <- max(abs(c_site[, c("CCA1", "CCA2")])) / max(abs(c_bp[, c("CCA1", "CCA2")]))
+
+ggplot(c_site, aes(CCA1, CCA2)) +
+  geom_hline(yintercept = 0, colour = "grey85") +
+  geom_vline(xintercept = 0, colour = "grey85") +
+  geom_point(alpha = 0.7) +
+  scale_colour_viridis_c() +
+  geom_point(data = c_feat, colour = "grey70", shape = 3, size = 1) +
+  geom_text(data = c_feat, aes(label = feature), size = 2.5, colour = "grey20", vjust = -0.5) +
+  geom_segment(data = c_bp, aes(x = 0, y = 0, xend = CCA1 * bp_mult, yend = CCA2 * bp_mult),
+               colour = "firebrick", linewidth = 0.8, arrow = arrow(length = unit(2, "mm"))) +
+  geom_text(data = c_bp, aes(x = CCA1 * bp_mult, y = CCA2 * bp_mult, label = var),
+            colour = "firebrick", vjust = -0.5) +
+  labs(title = "CCA triplot: plots (points), features (+), climate (red)") +
+  theme_bw()
+```
+
+CCA gives rare features extreme scores, so check that the labelled features are not just ones that are almost always zero.
+
+```{r cca-rare-check}
+round(feat_zero[c_top$feature], 2)
+```
+
+### Interpreting the CCA axes
+
+The biplot scores show which climate variables define each constrained axis.
+
+```{r cca-bp}
+round(scores(cca1, display = "bp", choices = 1:2), 2)
+```
+
+These are the features at each end of CCA1. They are the candidates for traits that vary along the climate gradient that CCA1 represents.
+
+```{r cca-ends, fig.width = 7, fig.height = 6}
+c1 <- c_feat[order(c_feat$CCA1), ]
+c1_ends <- rbind(head(c1, 10), tail(c1, 10))
+
+ggplot(c1_ends, aes(reorder(feature, CCA1), CCA1)) +
+  geom_col(fill = "darkgreen") +
+  coord_flip() +
+  labs(x = NULL, y = "CCA1 score", title = "Features at the ends of CCA1") +
+  theme_bw()
+```
+
+The plots below show raw plot activations for the two features at each end of CCA1, against the climate variable most strongly tied to CCA1. Humped or monotone shapes here are a direct check of the unimodal-response assumption.
+
+```{r cca-response, fig.width = 8, fig.height = 6}
+bp <- scores(cca1, display = "bp", choices = 1)
+best_var <- rownames(bp)[which.max(abs(bp[, 1]))]
+show_feat <- c(head(c1$feature, 2), tail(c1$feature, 2))
+
+resp <- data.frame(clim_value = rep(env[[best_var]], length(show_feat)),
+                   feature    = rep(show_feat, each = nrow(Y)),
+                   activation = as.vector(Y[, show_feat]))
+
+ggplot(resp, aes(clim_value, activation)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess", colour = "firebrick") +
+  facet_wrap(~ feature, scales = "free_y") +
+  labs(x = best_var, y = "Mean of image-max activation") +
+  theme_bw()
+```
+
+## Session info
+
+```{r session}
+sessionInfo()
+```
